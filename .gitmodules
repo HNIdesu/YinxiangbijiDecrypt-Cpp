@@ -1,0 +1,6 @@
+[submodule "deps/xerces-c"]
+	path = deps/xerces-c
+	url = https://github.com/HNIdesu/xerces-c.git
+[submodule "deps/openssl"]
+	path = deps/openssl
+	url = https://github.com/HNIdesu/openssl.git

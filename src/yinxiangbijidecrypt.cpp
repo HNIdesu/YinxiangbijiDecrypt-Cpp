@@ -1,9 +1,13 @@
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <filesystem>
 #include <vector>
-#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <cstring>
 #include "utility.hpp"
+#include "Path.hpp"
 #include "logger.hpp"
 #include "openssl/hmac.h"
 #include "openssl/evp.h"
@@ -11,6 +15,8 @@
 #include "xercesc/util/PlatformUtils.hpp"
 #include "xercesc/parsers/XercesDOMParser.hpp"
 #include "xercesc/framework/LocalFileFormatTarget.hpp"
+#include <xercesc/util/TransService.hpp>
+#include "xercesc/util/PlatformUtils.hpp"
 
 using namespace std;
 using namespace xercesc;
@@ -22,17 +28,28 @@ static void print_help_text(){
     Logger::log(TAG,"","\n",{"Usage: yinxiangbijidecrypt <file_path|directory_path>"});
     return;
 }
-
-static unique_ptr<Byte> base64_decode(char* input,uint32_t& result_length){
-    uint32_t readPtr=0,writePtr=0,count=0;
-    for (auto ch=input[readPtr];ch;ch=input[++readPtr]){
-        if(ch!='\r'&&ch!='\n'&&ch!=' ')
-            input[writePtr++]=ch;
-        if(ch=='=')count++;
+bool flag=false;
+static unique_ptr<Byte[]> base64_decode(const char* input,uint32_t& result_length){
+    auto const ctx=EVP_ENCODE_CTX_new();
+    EVP_DecodeInit(ctx);
+    auto const raw_length=strlen(input);
+    auto pbuffer=unique_ptr<Byte[]>(new Byte[raw_length/4*3]);
+    uint32_t decoded_length=0,i=0;
+    int out_length;
+    for (auto ch=input[i];ch;ch=input[i]){
+        if(ch=='\r'||ch=='\n')
+        {
+            i++;
+            continue;
+        }
+        EVP_DecodeUpdate(ctx,pbuffer.get()+decoded_length,&out_length,(const Byte*)input+i,4);
+        decoded_length+=out_length;
+        i+=4;
     }
-    input[writePtr]='\0';
-    auto pbuffer=unique_ptr<Byte>(new Byte[writePtr/4*3]);
-    result_length= EVP_DecodeBlock(pbuffer.get(),(const Byte*)input,writePtr)-count;
+    EVP_DecodeFinal(ctx,pbuffer.get()+decoded_length,&out_length);
+    EVP_ENCODE_CTX_free(ctx);
+    decoded_length+=out_length;
+    result_length= decoded_length;
     return pbuffer;
 }
 
@@ -100,84 +117,86 @@ static uint32_t decrypt_note(Byte* encrypted_data,int encrypted_data_length){
         throw runtime_error("Hash verify failed");
     aes_cbc_decrypt(key1,iv,encrypted_content,encrypted_note_length,encrypted_data,bytes_read);
     return bytes_read-1;
-    
 }
 
-class XmlStringGC{
+class XmlStringTranscoder{
 private:
-vector<XMLCh*>* xmlStrList;
-vector<char*>* cStrList;
+    vector<u16string*>* xmlStrList;
+    vector<string*>* cStrList;
+    wstring_convert<codecvt_utf8_utf16<XMLCh>,XMLCh> convert;
 public:
-    char* add(char* cStr){
-        cStrList->push_back(cStr);
-        return cStr;
+    const XMLCh* transcode(const char* cStr){
+        auto const result=new u16string(convert.from_bytes(cStr));
+        xmlStrList->push_back(result);
+        return result->c_str();
     }
-    XMLCh* add(XMLCh* xmlStr){
-        xmlStrList->push_back(xmlStr);
-        return xmlStr;
+    const char* transcode(const XMLCh* xmlStr){
+        auto const result=new string(convert.to_bytes(xmlStr));
+        cStrList->push_back(result);
+        return result->c_str();
     }
-    XmlStringGC(){
-        xmlStrList=new vector<XMLCh*>();
-        cStrList=new vector<char*>();
+    XmlStringTranscoder(){
+        xmlStrList=new vector<u16string*>();
+        cStrList=new vector<string*>();
     }
-    ~XmlStringGC(){
-        for(auto xmlStr:*xmlStrList)
-            XMLString::release(&xmlStr);
-        for(auto cStr:*cStrList)
-            XMLString::release(&cStr);
+    ~XmlStringTranscoder(){
+        for(auto const s : *xmlStrList)
+            delete s;
+        for(auto const s : *cStrList)
+            delete s;
         delete xmlStrList;
         delete cStrList;
     }
 };
 
-static void save_xml_to_file(const char* filepath,DOMDocument* dom,XmlStringGC* gc){
-    auto const impl=DOMImplementationRegistry::getDOMImplementation(gc->add(XMLString::transcode("LS")));
+static void save_xml_to_file(const char* filepath,xercesc::DOMDocument* dom,XmlStringTranscoder* gc){
+    auto const impl=DOMImplementationRegistry::getDOMImplementation(gc->transcode("LS"));
     auto const serializer= impl->createLSSerializer();
     auto const output=impl->createLSOutput();
-    LocalFileFormatTarget target(filepath);
+    LocalFileFormatTarget target(gc->transcode(filepath));
     output->setByteStream(&target);
     serializer->write(dom,output);
     serializer->release();
     output->release();
 }
 
-static void decrypt_file(const char* filepath){
-    Logger::log(TAG," ","\n",{"Starting to dectypt",filepath});
+static void decrypt_file(string filepath){
+    Logger::log(TAG," ","\n",{"Starting to dectypt",filepath.c_str()});
     xercesc::XercesDOMParser parser;
-    XmlStringGC gc;
-    parser.setLoadExternalDTD(false); 
-    parser.setValidationScheme(XercesDOMParser::Val_Never); 
-    parser.parse(filepath);
+    XmlStringTranscoder tr1;
+    parser.setLoadExternalDTD(false);
+    parser.setValidationScheme(XercesDOMParser::Val_Never);
+    parser.parse(tr1.transcode(filepath.c_str()));
     auto const dom=parser.getDocument();
     if (!dom) {
-        Logger::error(TAG," ","\n",{"Failed to parse document:",filepath});
+        Logger::error(TAG," ","\n",{"Failed to parse document:",filepath.c_str()});
         return;
     }
     auto const root=dom->getDocumentElement();
     if (!root) {
-        Logger::error(TAG," ","\n",{"Root element is null in file:",filepath});
+        Logger::error(TAG," ","\n",{"Root element is null in file:",filepath.c_str()});
         return;
     }
-    auto const theNotes=root->getElementsByTagName(gc.add(XMLString::transcode("note")));
+    auto const theNotes=root->getElementsByTagName(tr1.transcode("note"));
     uint32_t totalCount=0,decryptedCount=0;
     for(XMLSize_t i=0,noteCount=theNotes->getLength();i<noteCount;i++){
         totalCount++;
-        XmlStringGC gc1;
+        XmlStringTranscoder tr2;
         try{
             auto const theNote=(DOMElement*)theNotes->item(i);
-            const char* const title=gc1.add(XMLString::transcode(theNote->getElementsByTagName(gc1.add(XMLString::transcode("title")))->item(0)->getTextContent()));
+            const char* const title=tr2.transcode(theNote->getElementsByTagName(tr2.transcode("title"))->item(0)->getTextContent());
             Logger::log(TAG," ","\n",{"Decrypting note:",title});
-            auto const contentElement=(DOMElement*)theNote->getElementsByTagName(gc1.add(XMLString::transcode("content")))->item(0);
-            const char* const encoding=gc1.add(XMLString::transcode(contentElement->getAttribute(gc1.add(XMLString::transcode("encoding")))));
+            auto const contentElement=(DOMElement*)theNote->getElementsByTagName(tr2.transcode("content"))->item(0);
+            const char* const encoding=tr2.transcode(contentElement->getAttribute(tr2.transcode("encoding")));
             if(!strcmp(encoding,"base64:aes")){
                 auto child=contentElement->getFirstChild();
-                auto const base64Content=gc1.add(XMLString::transcode(contentElement->getTextContent()));
+                auto const base64Content=tr2.transcode(contentElement->getTextContent());
                 uint32_t encrypted_data_length;
                 auto content_data = base64_decode(base64Content,encrypted_data_length);
                 auto const note_length=decrypt_note(content_data.get(),encrypted_data_length);
                 auto const raw_data=content_data.get();
-                contentElement->replaceChild(dom->createCDATASection(gc1.add(XMLString::transcode((const char*)raw_data))),child);
-                contentElement->removeAttribute(gc1.add(XMLString::transcode("encoding")));
+                contentElement->replaceChild(dom->createCDATASection(tr2.transcode((const char*)raw_data)),child);
+                contentElement->removeAttribute(tr2.transcode("encoding"));
             }else
                 continue;
             decryptedCount++;
@@ -187,31 +206,45 @@ static void decrypt_file(const char* filepath){
         
     }
     Logger::log(TAG," ","\n",{"Decryption succeeded,",to_string(decryptedCount).c_str(),"notes decrypted,",to_string(totalCount).c_str(),"notes in total"});
-    fs::path newpath(filepath);
-    newpath.replace_extension(".enex");
-    save_xml_to_file(newpath.c_str(),dom,&gc);
+    auto const newpath=Path(filepath).ReplaceExtension(".enex").ToUtf8String();
+    save_xml_to_file(newpath.c_str(),dom,&tr1);
     Logger::log(TAG," ","\n",{"File has been saved to",newpath.c_str()});
 }
 
 int main(int argc,char** argv){
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);
+#endif
     if(argc<=1){
         print_help_text();
         return 0;
     }
+    unique_ptr<Path> path;
+#ifdef _WIN32
+    auto const cp=GetACP();
+    auto path_length=strlen(argv[1]);
+    auto path_buffer=new wchar_t[path_length+1];
+    path_buffer[MultiByteToWideChar(cp,NULL,argv[1],path_length,path_buffer,path_length+1)]=L'\0';
+    path=unique_ptr<Path>(new Path(path_buffer));
+#else
+    path=unique_ptr<Path>(new Path(argv[1]));
+#endif
+    if(!path->Exists())
+    {
+        auto const u8path=path->ToUtf8String();
+        Logger::error(TAG," ","\n",{"Path",u8path.c_str(),"not exists"});
+        return 0;
+    }
     try{
         XMLPlatformUtils::Initialize();
-        const char* const path=argv[1];
-        if(!fs::exists(path))
-        {
-            Logger::error(TAG," ","\n",{"Path",path,"not exists"});
-            return 0;
-        }
-        if(fs::is_directory(path)){
-            for(auto const entry : fs::directory_iterator(path))
-                if(!strcmp(entry.path().extension().c_str(),".notes"))
-                    decrypt_file(entry.path().c_str());
+        if(path->IsDirectory()){
+            for(auto const entry : path->EnumerateFiles()){
+                Path entryPath(entry.path());
+                if(entryPath.HasExtension(".notes"))
+                    decrypt_file(entryPath.ToUtf8String());
+            }
         }else
-            decrypt_file(path);
+            decrypt_file(path->ToUtf8String());
         Logger::log(TAG,"","\n",{"File decryption completed"});
         XMLPlatformUtils::Terminate();
     }catch(exception ex){
